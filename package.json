@@ -1,0 +1,70 @@
+{
+  "name": "@codebam/dsh-opensandbox",
+  "version": "0.1.0",
+  "description": "Run DeepSeek Harness command execution in OpenSandbox containers: an OpenSandbox-backed ctx.subprocess and container-world ctx.sandbox for dsh.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "opensandbox",
+    "sandbox",
+    "container",
+    "cordis",
+    "agent"
+  ],
+  "license": "MIT",
+  "author": "codebam",
+  "homepage": "https://github.com/codebam/dsh-opensandbox#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codebam/dsh-opensandbox.git"
+  },
+  "bugs": {
+    "url": "https://github.com/codebam/dsh-opensandbox/issues"
+  },
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "for f in index.mjs src/*.mjs; do node --check \"$f\" || exit 1; done",
+    "test": "node test/mock-e2e.mjs",
+    "pack:check": "npm pack --dry-run"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-sandbox": "*",
+    "@deepseek-ai/dsh-subprocess": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-sandbox": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-subprocess": {
+      "optional": true
+    }
+  }
+}

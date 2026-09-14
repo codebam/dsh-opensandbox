@@ -1,0 +1,137 @@
+# @codebam/dsh-opensandbox
+
+Run the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) execution world inside
+[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) containers.
+
+The plugin registers two dsh services:
+
+| Service | Replacement | Effect |
+| --- | --- | --- |
+| `ctx.subprocess` | `@deepseek-ai/dsh-subprocess-local` | Commands and PTY shells run through OpenSandbox execd. |
+| `ctx.sandbox` | `@deepseek-ai/dsh-sandbox-local` | Reports the container world's confinement facts to dsh's stock sandbox-aware consumers. |
+
+Because `ctx.subprocess` is the shared execution seam, these existing dsh plugins keep working
+over the container world without code changes:
+
+- `@deepseek-ai/dsh-bash-sandbox` — the model-facing `bash` tool
+- `@deepseek-ai/dsh-terminal-bash` — persistent PTY sessions (`bash`)
+- `@deepseek-ai/dsh-tool-fs-search` — `grep`/`glob` run inside the sandbox
+- dsh's permission/escalation flow and `sandbox:policy` context
+
+The configured workspace is bind-mounted into the sandbox at the same absolute path, so the host
+`ctx.fs` provider and the sandbox see the same files. `ctx.fs` itself stays host-side in this
+release: the container is the boundary for **command execution**, not a replacement filesystem.
+
+## Requirements
+
+- Node.js >= 20 (dsh bundles a newer Node).
+- A reachable OpenSandbox lifecycle server with the Docker runtime.
+- The OpenSandbox server must allow-list the host paths you mount. In its TOML:
+
+  ```toml
+  [storage]
+  allowed_host_paths = ["/home/your-user", "/persistent", "/tmp", "/nix/store"]
+  ```
+
+- The sandbox image must contain `/bin/sh` and a `sleep` that accepts `infinity`
+  (`debian:*`, `ubuntu:*`, `python:*` and similar images do).
+
+## Install
+
+```bash
+npm install @codebam/dsh-opensandbox
+```
+
+dsh provides the `@deepseek-ai/*` peer packages at runtime, so they are marked optional and are not
+fetched from npm by this package.
+
+## Configure dsh
+
+Add the plugin to a dsh profile and disable the two local providers it replaces. A profile
+`cordis.patch.yml` (for example `$DSH_HOME/profiles/dsh-tui/cordis.patch.yml`) looks like this:
+
+```yaml
+- id: subprocess
+  disabled: true
+
+- id: sandbox
+  disabled: true
+
+- insert:
+    - id: opensandbox-world
+      name: '@codebam/dsh-opensandbox'
+      config:
+        # Connection (or set OPEN_SANDBOX_API_KEY / OPEN_SANDBOX_DOMAIN in dsh's environment).
+        apiKeyFile: /run/user/1000/opensandbox/api-key
+        domain: 127.0.0.1:8090
+
+        # Sandbox image and workspace.
+        image: docker.io/library/debian:bookworm-slim
+        workspaceRoot: /home/your-user/project
+        extraReadOnlyMounts:
+          - /nix/store
+
+        # Limits and lifetime.
+        timeoutSeconds: 43200
+        cpu: "4"
+        memory: 8Gi
+```
+
+Relative `name` values resolve from dsh's profile `node_modules`, where `npm install
+@codebam/dsh-opensandbox` places the package. An absolute path to `index.mjs` also works.
+
+## Configuration
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `apiKey` | `OPEN_SANDBOX_API_KEY` | Lifecycle/execd API key. |
+| `apiKeyFile` | `OPEN_SANDBOX_API_KEY_FILE` | File holding the API key; read at startup. |
+| `domain` | `OPEN_SANDBOX_DOMAIN` or `localhost:8080` | Lifecycle host, optionally with port. |
+| `protocol` | `OPEN_SANDBOX_PROTOCOL` or `http` | `http` or `https`. |
+| `image` | `docker.io/library/debian:bookworm-slim` | Sandbox image URI. Pin a digest in production. |
+| `workspaceRoot` | `process.cwd()` | Host directory mounted read-write at the same path. |
+| `extraReadOnlyMounts` | `["/nix/store"]` | Extra host dirs mounted read-only at the same path. |
+| `timeoutSeconds` | `43200` | Sandbox TTL; the server minimum is 60. |
+| `requestTimeoutMs` | `300000` | Lifecycle HTTP timeout. |
+| `sandboxWaitMs` | `180000` | Max wait for a new sandbox to report `Running`. |
+| `commandTimeoutMs` | `0` (disabled) | Optional execd-side per-command timeout. |
+| `cpu` / `memory` | `"4"` / `"8Gi"` | Container resource limits. |
+| `home` | `/root` | Container `HOME`. |
+
+## What runs where
+
+- One sandbox is created lazily per workspace root for the life of the dsh process.
+- Setup, cleanup, and usage are recorded in the sandbox metadata (`codebam.dsh.workspace`).
+- `danger-full-access` still runs in the OpenSandbox world; the plugin never falls back to host
+  execution.
+- Confined modes report `enforcement: "partial"`, because the container bounds host file effects
+  but does not re-express workspace-only/read-only semantics inside the container. The host-side
+  `ctx.fs` fence still enforces workspace writes for the model's file tools.
+
+## Publishing
+
+```bash
+npm run check
+npm pack --dry-run
+npm publish --access public
+```
+
+The package name is scoped and `publishConfig.access` is `public`, so the explicit flag is only a
+reminder.
+
+## Development
+
+```bash
+npm install
+npm run check
+```
+
+There is no build step: the published files are the same ESM files dsh loads.
+
+## License
+
+MIT
+
+OpenSandbox and DeepSeek Harness are separate projects with their own licenses. This plugin talks
+to OpenSandbox over its HTTP/WebSocket APIs and mounts the dsh capability seams provided by the
+harness.
