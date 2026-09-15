@@ -60,6 +60,14 @@ export const Config = z.object({
   memory: z.string().required(false),
   /** Container HOME. Default: /root. */
   home: z.string().required(false),
+  /** Extra environment variables for every sandbox command; wins over `forwardEnv`. */
+  env: z.dict(z.string()).required(false),
+  /**
+   * Host environment variable names to forward into the sandbox, so tools that
+   * authenticate from the host's prepared environment (GH_TOKEN, SSH_AUTH_SOCK)
+   * keep working there. Unset or empty names are skipped rather than blanked.
+   */
+  forwardEnv: z.array(z.string()).required(false),
 })
 
 /**

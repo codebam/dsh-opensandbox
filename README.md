@@ -113,6 +113,8 @@ Relative `name` values resolve from dsh's profile `node_modules`, where `npm ins
 | `commandTimeoutMs` | `0` (disabled) | Optional execd-side per-command timeout. |
 | `cpu` / `memory` | `"4"` / `"8Gi"` | Container resource limits. |
 | `home` | `/root` | Container `HOME`. |
+| `env` | `{}` | Extra environment variables for every sandbox command. Wins over `forwardEnv`. |
+| `forwardEnv` | `[]` | Host environment variable names to forward into the sandbox (`GH_TOKEN`, `SSH_AUTH_SOCK`). Unset names are skipped, not blanked. |
 
 ## What runs where
 
@@ -129,6 +131,22 @@ Relative `name` values resolve from dsh's profile `node_modules`, where `npm ins
   `ctx.fs` fence still enforces workspace writes for the model's file tools.
 - A read-only store means `nix build` cannot add paths from inside the sandbox; mount the host's
   `nix/var/nix/daemon-socket` too (and accept what that grants) if containerized builds are wanted.
+
+### Making the sandbox a usable workspace
+
+Two capabilities a coding agent expects are configuration, not code:
+
+- **Builds** need the host's Nix client config and daemon socket mounted read-only (`/etc/nix`,
+  `/nix/var/nix/daemon-socket`). The container's `nix` then talks to the host daemon, which owns the
+  store and does the building. Mounting the socket grants the sandbox the ability to build and add
+  store paths as your user.
+- **Commits and pushes** need the git config, the GPG homedir and the agent runtime dir mounted
+  read-only (`~/.config/git`, `~/.gnupg`, `/run/user/$UID/gnupg`), `GIT_CONFIG_GLOBAL` pointed at a
+  sandbox git config that sets `gpg.program` and `core.sshCommand`, and `SSH_AUTH_SOCK` forwarded.
+  A read-only GPG homedir cannot sign at all — gpg must write lock files — so `gpg.program` has to
+  be a wrapper that copies the keyring into the container and links the agent socket; the private
+  key itself never enters the sandbox when it lives on a smartcard. Forward `GH_TOKEN` as well if
+  `gh` should work inside.
 
 ## Publishing
 

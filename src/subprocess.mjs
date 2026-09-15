@@ -84,6 +84,19 @@ function normalizeConfig(config = {}) {
   for (const entry of DEFAULT_CONTAINER_PATH) {
     if (!containerPath.includes(entry)) containerPath.push(entry)
   }
+  // Environment handed to every sandbox command. Forwarded host names come
+  // first and explicit `env` entries win; a forwarded name that is unset on the
+  // host is skipped rather than exported empty, so a missing GH_TOKEN looks
+  // missing inside the sandbox too.
+  const containerEnvOverrides = {}
+  for (const name of config.forwardEnv ?? []) {
+    const key = String(name)
+    const value = process.env[key]
+    if (typeof value === 'string' && value.length > 0) containerEnvOverrides[key] = value
+  }
+  for (const [key, value] of Object.entries(config.env ?? {})) {
+    if (typeof value === 'string') containerEnvOverrides[key] = value
+  }
   return {
     workspaceRoot,
     image: textOr(config.image, DEFAULT_IMAGE),
@@ -101,7 +114,7 @@ function normalizeConfig(config = {}) {
       HOME: textOr(config.home, '/root'),
       TERM: 'dumb',
       LANG: 'C.UTF-8',
-      ...(config.env ?? {}),
+      ...containerEnvOverrides,
     },
     apiKey: resolveApiKey(config),
     apiKeyFile: textOr(config.apiKeyFile, textOr(process.env.OPEN_SANDBOX_API_KEY_FILE, '')),

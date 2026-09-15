@@ -93,6 +93,27 @@ if (systemBinPresent) {
   assert.equal(loaderResolved.config.hostSearchDirs.includes(systemBin), visible)
 }
 
+// Regression: `forwardEnv` restores host-prepared credentials (GH_TOKEN, the
+// SSH agent socket) that the container world would otherwise drop, while an
+// explicitly configured `env` entry has to win over a forwarded name.
+process.env.OSB_TEST_FORWARDED = 'from-host'
+process.env.OSB_TEST_OVERRIDDEN = 'host-value'
+const envResolved = new OpenSandboxSubprocess(
+  new Context(),
+  opensandbox.Config({
+    domain: '127.0.0.1:1',
+    apiKey: 'test-key',
+    image: 'example/test:latest',
+    workspaceRoot: '/tmp',
+    env: { OSB_TEST_OVERRIDDEN: 'config-value', OSB_TEST_LITERAL: 'literal' },
+    forwardEnv: ['OSB_TEST_FORWARDED', 'OSB_TEST_OVERRIDDEN', 'OSB_TEST_UNSET'],
+  }),
+)
+assert.equal(envResolved.config.containerEnv.OSB_TEST_FORWARDED, 'from-host')
+assert.equal(envResolved.config.containerEnv.OSB_TEST_OVERRIDDEN, 'config-value')
+assert.equal(envResolved.config.containerEnv.OSB_TEST_LITERAL, 'literal')
+assert.equal('OSB_TEST_UNSET' in envResolved.config.containerEnv, false)
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${server.address().port}`)
   const path = url.pathname
@@ -108,6 +129,9 @@ const server = createServer(async (req, res) => {
         assert.equal(readOnly.length, 1)
         assert.equal(readOnly[0].mountPath, '/nix/store')
       }
+      // Configured and forwarded environment reaches the sandbox itself.
+      assert.equal(body.env.OSB_TEST_LITERAL, 'literal')
+      assert.equal(body.env.OSB_TEST_FORWARDED, 'from-host')
       res.writeHead(201, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ id: 'sbx-test' }))
       return
@@ -204,6 +228,8 @@ try {
     workspaceRoot: '/tmp',
     requestTimeoutMs: 10_000,
     sandboxWaitMs: 5_000,
+    env: { OSB_TEST_LITERAL: 'literal' },
+    forwardEnv: ['OSB_TEST_FORWARDED'],
   }))
 
   const handle = provider.spawn({
@@ -220,6 +246,8 @@ try {
   assert.equal(captured.commands[0].command, "'/bin/bash' '-c' 'echo hello'")
   assert.equal(captured.commands[0].argv, undefined)
   assert.equal(captured.commands[0].envs.PATH.includes('/usr/bin'), true)
+  assert.equal(captured.commands[0].envs.OSB_TEST_LITERAL, 'literal')
+  assert.equal(captured.commands[0].envs.OSB_TEST_FORWARDED, 'from-host')
   if (systemBinPresent) {
     assert.equal(captured.commands[0].envs.PATH.includes(realpathSync('/run/current-system/sw/bin')), true)
   }
