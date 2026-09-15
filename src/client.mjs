@@ -211,6 +211,11 @@ export class OpenSandboxClient {
     }
   }
 
+  /** Drop the cached execd endpoint for one sandbox. */
+  forgetEndpoint(id) {
+    this.execdBases.delete(id)
+  }
+
   /** Resolve (and cache) the server-proxied execd base for one sandbox. */
   async execdBase(id, signal) {
     const cached = this.execdBases.get(id)

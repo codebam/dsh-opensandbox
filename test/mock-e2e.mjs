@@ -6,8 +6,9 @@ import { WebSocketServer } from 'ws'
 import opensandbox from '../index.mjs'
 import { OpenSandboxSubprocess } from '../src/subprocess.mjs'
 
-const captured = { commands: [], pty: [] }
-let nextPort = 18080
+const captured = { commands: [], pty: [], sandboxCreates: [] }
+let sandboxSeq = 0
+const liveSandboxes = new Set()
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -117,6 +118,12 @@ assert.equal('OSB_TEST_UNSET' in envResolved.config.containerEnv, false)
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${server.address().port}`)
   const path = url.pathname
+  const sandboxMatch = path.match(/^\/v1\/sandboxes\/([^/]+)$/)
+  const endpointMatch = path.match(/^\/v1\/sandboxes\/([^/]+)\/endpoints\/44772$/)
+  const commandMatch = path.match(/^\/v1\/sandboxes\/([^/]+)\/proxy\/44772\/command$/)
+  const ptyMatch = path.match(/^\/v1\/sandboxes\/([^/]+)\/proxy\/44772\/pty$/)
+  const ptyDeleteMatch = path.match(/^\/v1\/sandboxes\/([^/]+)\/proxy\/44772\/pty\/pty-1$/)
+  const isLive = (id) => liveSandboxes.has(id)
   try {
     if (req.method === 'POST' && path === '/v1/sandboxes') {
       const body = await readJson(req)
@@ -132,27 +139,32 @@ const server = createServer(async (req, res) => {
       // Configured and forwarded environment reaches the sandbox itself.
       assert.equal(body.env.OSB_TEST_LITERAL, 'literal')
       assert.equal(body.env.OSB_TEST_FORWARDED, 'from-host')
+      sandboxSeq += 1
+      const id = sandboxSeq === 1 ? 'sbx-test' : `sbx-test-${sandboxSeq}`
+      liveSandboxes.add(id)
+      captured.sandboxCreates.push({ id, body })
       res.writeHead(201, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ id: 'sbx-test' }))
+      res.end(JSON.stringify({ id }))
       return
     }
-    if (req.method === 'GET' && path === '/v1/sandboxes/sbx-test') {
+    if (req.method === 'GET' && sandboxMatch !== null && isLive(sandboxMatch[1])) {
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ id: 'sbx-test', status: { state: 'Running' } }))
+      res.end(JSON.stringify({ id: sandboxMatch[1], status: { state: 'Running' } }))
       return
     }
-    if (req.method === 'DELETE' && path === '/v1/sandboxes/sbx-test') {
+    if (req.method === 'DELETE' && sandboxMatch !== null) {
+      liveSandboxes.delete(sandboxMatch[1])
       res.writeHead(204); res.end(); return
     }
-    if (req.method === 'GET' && path === '/v1/sandboxes/sbx-test/endpoints/44772') {
+    if (req.method === 'GET' && endpointMatch !== null && isLive(endpointMatch[1])) {
       assert.equal(url.searchParams.get('use_server_proxy'), null)
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ endpoint: `127.0.0.1:${server.address().port}/v1/sandboxes/sbx-test/proxy/44772` }))
+      res.end(JSON.stringify({ endpoint: `127.0.0.1:${server.address().port}/v1/sandboxes/${endpointMatch[1]}/proxy/44772` }))
       return
     }
-    if (req.method === 'POST' && path === '/v1/sandboxes/sbx-test/proxy/44772/command') {
+    if (req.method === 'POST' && commandMatch !== null && isLive(commandMatch[1])) {
       const body = await readJson(req)
-      captured.commands.push(body)
+      captured.commands.push({ ...body, sandboxId: commandMatch[1] })
       const failed = typeof body.command === 'string' && body.command.includes('__fail')
       if (failed) {
         sse(res, [
@@ -169,18 +181,18 @@ const server = createServer(async (req, res) => {
       }
       return
     }
-    if (req.method === 'DELETE' && path === '/v1/sandboxes/sbx-test/proxy/44772/command') {
-      captured.commands.push({ interrupted: url.searchParams.get('id') })
+    if (req.method === 'DELETE' && commandMatch !== null) {
+      captured.commands.push({ interrupted: url.searchParams.get('id'), sandboxId: commandMatch[1] })
       res.writeHead(200); res.end(); return
     }
-    if (req.method === 'POST' && path === '/v1/sandboxes/sbx-test/proxy/44772/pty') {
+    if (req.method === 'POST' && ptyMatch !== null && isLive(ptyMatch[1])) {
       const body = await readJson(req)
-      captured.pty.push(body)
+      captured.pty.push({ ...body, sandboxId: ptyMatch[1] })
       res.writeHead(201, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ session_id: 'pty-1' }))
       return
     }
-    if (req.method === 'DELETE' && path === '/v1/sandboxes/sbx-test/proxy/44772/pty/pty-1') {
+    if (req.method === 'DELETE' && ptyDeleteMatch !== null) {
       res.writeHead(200); res.end(); return
     }
     res.writeHead(404); res.end('not found')
@@ -192,7 +204,8 @@ const server = createServer(async (req, res) => {
 const wss = new WebSocketServer({ noServer: true })
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://127.0.0.1')
-  if (url.pathname !== '/v1/sandboxes/sbx-test/proxy/44772/pty/pty-1/ws') {
+  const match = url.pathname.match(/^\/v1\/sandboxes\/([^/]+)\/proxy\/44772\/pty\/pty-1\/ws$/)
+  if (match === null || !liveSandboxes.has(match[1])) {
     socket.destroy(); return
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
@@ -277,6 +290,45 @@ try {
   assert.equal(output.join('').includes('bye'), true)
   assert.equal(captured.pty[0].cwd, '/tmp')
   assert.equal(captured.pty[0].command.includes("'PS1=dsh> '"), true)
+  assert.equal(captured.pty[0].sandboxId, 'sbx-test')
+
+  // Regression: the lifecycle server reaps a sandbox at its TTL. The cached
+  // create promise must not keep pointing at the dead execd endpoint; the next
+  // command revalidates, creates a replacement, and succeeds instead of
+  // failing with `fetch failed` until dsh restarts.
+  liveSandboxes.delete('sbx-test')
+  const afterExpiry = provider.spawn({
+    argv: ['/bin/bash', '-c', 'echo after-expiry'],
+    cwd: '/tmp',
+    graceMs: 1_000,
+    stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 1024 } },
+  })
+  const afterExpiryOutcome = await afterExpiry.done
+  assert.equal(afterExpiryOutcome.exitCode, 0)
+  assert.equal(afterExpiry.collected.stdout.readFrom(0).text, 'hello\n')
+  assert.equal(captured.sandboxCreates.length, 2)
+  assert.equal(captured.sandboxCreates[1].id, 'sbx-test-2')
+  const lastCommand = captured.commands[captured.commands.length - 1]
+  assert.equal(lastCommand.sandboxId, 'sbx-test-2')
+  assert.equal(lastCommand.command, "'/bin/bash' '-c' 'echo after-expiry'")
+
+  // A PTY started after the expiry has to ride the replacement sandbox too.
+  const terminalAfter = await provider.spawnTerminal({
+    argv: ['/bin/bash', '--noprofile', '--norc', '-i'],
+    cwd: '/tmp',
+    env: { PS1: 'dsh> ' },
+    rows: 24,
+    cols: 80,
+    graceMs: 1_000,
+  })
+  const outputAfter = []
+  terminalAfter.output.on('data', (chunk) => outputAfter.push(String(chunk)))
+  await terminalAfter.write('exit\n')
+  const termAfterOutcome = await terminalAfter.done
+  assert.equal(termAfterOutcome.exitCode, 0)
+  assert.equal(outputAfter.join('').includes('bye'), true)
+  const lastPtyCreate = [...captured.pty].reverse().find((entry) => entry.sandboxId !== undefined)
+  assert.equal(lastPtyCreate.sandboxId, 'sbx-test-2')
 
   await provider.close()
   console.log('mock-e2e ok')

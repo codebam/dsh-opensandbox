@@ -178,18 +178,55 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
     throw new OpenSandboxError(`OpenSandbox: command cwd ${cwd} is not a host directory under a mounted root`)
   }
 
-  /** Ensure (once) the OpenSandbox sandbox that mounts one workspace root. */
-  ensureSandboxFor(cwd) {
-    if (this.closed) throw new OpenSandboxError('OpenSandbox: provider is closed')
-    const root = this.mountRootFor(cwd)
-    const cached = this.sandboxes.get(root)
-    if (cached !== undefined) return cached
+  /** Create, cache, and return one sandbox promise for a workspace root. */
+  startSandbox(root) {
     const created = this.createSandbox(root)
     this.sandboxes.set(root, created)
     created.catch(() => {
-      this.sandboxes.delete(root)
+      if (this.sandboxes.get(root) === created) this.sandboxes.delete(root)
     })
     return created
+  }
+
+  /** True when the lifecycle server still reports one sandbox Running. */
+  async sandboxIsAlive(sandboxId) {
+    const info = await this.client.getSandbox(sandboxId)
+    if (info === undefined) return false
+    const state = String(info?.status?.state ?? info?.state ?? '')
+    return state === 'Running'
+  }
+
+  /**
+   * Ensure the sandbox for one workspace root exists and is Running.
+   *
+   * The server reaps a sandbox at its TTL, and a resolved create promise
+   * cannot be reused after that: its cached execd endpoint is dead, so every
+   * later command fails with `fetch failed` until dsh restarts. Revalidate the
+   * cached sandbox against the lifecycle server and create a replacement when
+   * it is gone; concurrent callers share the replacement promise.
+   */
+  async ensureSandboxFor(cwd) {
+    if (this.closed) throw new OpenSandboxError('OpenSandbox: provider is closed')
+    const root = this.mountRootFor(cwd)
+    const cached = this.sandboxes.get(root)
+    if (cached === undefined) return this.startSandbox(root)
+
+    let sandboxId = ''
+    try {
+      sandboxId = await cached
+    } catch {
+      // A failed create has no id to revalidate; startSandbox below retries.
+    }
+    if (sandboxId.length > 0) {
+      if (await this.sandboxIsAlive(sandboxId)) return sandboxId
+      this.client.forgetEndpoint(sandboxId)
+    }
+    if (this.sandboxes.get(root) === cached) {
+      this.sandboxes.delete(root)
+      return this.startSandbox(root)
+    }
+    const replacement = this.sandboxes.get(root)
+    return replacement === undefined ? this.startSandbox(root) : replacement
   }
 
   /** Create one sandbox with the host workspace and toolchain mounts. */

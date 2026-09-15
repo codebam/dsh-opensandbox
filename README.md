@@ -107,7 +107,7 @@ Relative `name` values resolve from dsh's profile `node_modules`, where `npm ins
 | `image` | `docker.io/library/debian:bookworm-slim` | Sandbox image URI. Pin a digest in production. |
 | `workspaceRoot` | `process.cwd()` | Host directory mounted read-write at the same path. |
 | `extraReadOnlyMounts` | `["/nix/store"]` | Extra host dirs mounted read-only at the same path. An empty list means this default, because the loader materializes an absent optional array as `[]`. |
-| `timeoutSeconds` | `43200` | Sandbox TTL; the server minimum is 60. |
+| `timeoutSeconds` | `43200` | Sandbox TTL; the server minimum is 60. The cached sandbox is revalidated before each command, so a server-reaped sandbox is replaced instead of leaving commands on a dead endpoint. |
 | `requestTimeoutMs` | `300000` | Lifecycle HTTP timeout. |
 | `sandboxWaitMs` | `180000` | Max wait for a new sandbox to report `Running`. |
 | `commandTimeoutMs` | `0` (disabled) | Optional execd-side per-command timeout. |
@@ -118,7 +118,7 @@ Relative `name` values resolve from dsh's profile `node_modules`, where `npm ins
 
 ## What runs where
 
-- One sandbox is created lazily per workspace root for the life of the dsh process.
+- One sandbox is created lazily per workspace root and revalidated against the lifecycle server before a command uses it. If the server reaped it at its TTL, the plugin creates a replacement instead of reusing the dead endpoint.
 - Setup, cleanup, and usage are recorded in the sandbox metadata (`codebam.dsh.workspace`).
 - The container `PATH` is the host `PATH` restricted to directories a mount makes visible, plus
   `/run/current-system/sw/bin`, `/etc/profiles/per-user/$USER/bin` and `~/.nix-profile/bin` when
