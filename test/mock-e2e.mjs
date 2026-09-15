@@ -50,6 +50,19 @@ assert.match(
   /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/,
 )
 
+// Regression: an absent stdout budget must not collapse the stream. The local
+// provider this replaces keeps an unbudgeted stream whole ("bytes > undefined"
+// is false); keeping one byte truncates every bash-tool result instead.
+const { TailCollector } = await import('../src/collect.mjs')
+const unbudgeted = new TailCollector({ spillMaxBytes: 1024 })
+unbudgeted.push('BASH_TOOL_OK\n')
+assert.equal(unbudgeted.readFrom(0).text, 'BASH_TOOL_OK\n')
+assert.equal(unbudgeted.readFrom(0).lossy, false)
+const budgeted = new TailCollector({ maxBytes: 4 })
+budgeted.push('BASH_TOOL_OK\n')
+assert.equal(budgeted.readFrom(0).text, '_OK\n')
+assert.equal(budgeted.readFrom(0).lossy, true)
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${server.address().port}`)
   const path = url.pathname

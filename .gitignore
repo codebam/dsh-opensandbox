@@ -1,4 +1,6 @@
-node_modules/
+# No trailing slash: the README's test setup symlinks dsh's profile modules
+# here, and `node_modules/` would not match a symlink.
+node_modules
 *.tgz
 *.log
 .DS_Store

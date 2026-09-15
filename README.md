@@ -38,14 +38,19 @@ release: the container is the boundary for **command execution**, not a replacem
 
 ### Known limitations
 
-- The `ctx.subprocess`/`ctx.sandbox` world works over plain HTTP execd calls.
-- `spawnTerminal` additionally needs a WebSocket to execd. The stock OpenSandbox
-  server running rootless podman currently cannot provide one: its server-side
-  WebSocket proxy fails to complete the handshake to the sandbox's published
-  execd port, and then crashes while reporting that failure on a `websockets`
-  API mismatch. Against that deployment only the HTTP executor (the model's
-  one-shot `bash` tool) is usable; persistent PTY sessions need a server whose
-  execd WebSocket is directly reachable.
+- `spawnTerminal` needs a WebSocket to execd, so this plugin asks the lifecycle
+  API for each sandbox's **direct** published endpoint (the official SDK default,
+  `use_server_proxy=false`) instead of routing through the server's own proxy.
+  That is deliberate: in the stock server image the API-proxy WebSocket route
+  never completes its handshake to the sandbox and then crashes while reporting
+  that failure on a `websockets` API mismatch. A deployment where the client
+  cannot reach the sandbox's published port directly is not supported.
+- `ctx.fs` stays host-side, and confinement inside the container is the
+  container itself: `confine()` reports `partial` enforcement for confined modes
+  because read-only/workspace-only semantics are not re-expressed per command.
+- Mounted host paths must be allow-listed by the server
+  (`[storage] allowed_host_paths`); a session cwd outside that list fails at
+  sandbox creation rather than falling back to the host.
 
 ## Install
 
@@ -138,6 +143,16 @@ npm run check
 ```
 
 There is no build step: the published files are the same ESM files dsh loads.
+
+`npm test` runs a mock E2E over an in-process fake OpenSandbox server (it asserts the
+execd request schema, SSE framing, metadata labels, and PTY frames). It imports
+`@deepseek-ai/cordis`, which dsh provides at runtime and npm cannot fetch, so point the
+checkout at any dsh install's modules first:
+
+```bash
+ln -sfn "$DSH_HOME/profiles/node_modules" node_modules   # DSH_HOME defaults to ~/.dsh
+npm test
+```
 
 ## License
 

@@ -13,7 +13,12 @@ import { join } from 'node:path'
  */
 export class TailCollector {
   constructor({ maxBytes, spillMaxBytes } = {}) {
-    this.maxBytes = Math.max(1, Number(maxBytes) || 1)
+    // A collect disposition always carries a positive byte budget, but mirror
+    // the local provider this replaces when one is absent: its overflow test is
+    // `bytes > undefined`, i.e. false, so an unbudgeted stream is kept whole
+    // rather than collapsed to its last byte.
+    const budget = Number(maxBytes)
+    this.maxBytes = Number.isFinite(budget) && budget > 0 ? Math.floor(budget) : Number.POSITIVE_INFINITY
     this.spillMaxBytes = Number(spillMaxBytes) > 0 ? Number(spillMaxBytes) : 0
     this.chunks = []
     this.totalBytes = 0
