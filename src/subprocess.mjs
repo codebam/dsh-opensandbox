@@ -1,4 +1,5 @@
 import { constants as fsConstants, accessSync, existsSync } from 'node:fs'
+import { homedir, userInfo } from 'node:os'
 import { delimiter, isAbsolute, join, resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
 import WebSocket from 'ws'
@@ -22,12 +23,35 @@ const DEFAULT_RESOURCE_CPU = '4'
 const DEFAULT_RESOURCE_MEMORY = '8Gi'
 const DEFAULT_CONTAINER_PATH = ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin']
 
+/**
+ * Host bin directories that belong to the toolchain but are not guaranteed to
+ * be on the ambient PATH. A dsh started by a systemd user unit inherits
+ * systemd's minimal default PATH, which carries no /nix/store entries at all,
+ * so the container would have the mount and still no way to name `git`, `nix`
+ * or `rg`. Every entry is resolved and mount-checked before use, so a host
+ * without these profiles is unaffected.
+ */
+function wellKnownBinDirs() {
+  const dirs = ['/run/current-system/sw/bin', join(homedir(), '.nix-profile/bin')]
+  try {
+    dirs.push(`/etc/profiles/per-user/${userInfo().username}/bin`)
+  } catch {
+    // No user-database entry: the other two still apply.
+  }
+  return dirs
+}
+
 /** Normalize plugin configuration into the shape the provider runs with. */
 function normalizeConfig(config = {}) {
   const workspaceRoot = realpathOrNormalized(textOr(config.workspaceRoot, process.cwd()))
-  const requestedReadOnly = Array.isArray(config.extraReadOnlyMounts)
-    ? config.extraReadOnlyMounts
-    : ['/nix/store']
+  // Schemastery materializes an absent optional array as [], so emptiness --
+  // not just undefined -- has to select the documented default. Reached
+  // through dsh's loader, a bare `[]` here dropped the toolchain mount and left
+  // the container with no /nix/store and none of the host tools.
+  const requestedReadOnly =
+    Array.isArray(config.extraReadOnlyMounts) && config.extraReadOnlyMounts.length > 0
+      ? config.extraReadOnlyMounts
+      : ['/nix/store']
   const extraReadOnlyMounts = []
   for (const entry of requestedReadOnly) {
     const path = realpathOrNormalized(String(entry))
@@ -40,16 +64,23 @@ function normalizeConfig(config = {}) {
   const commandTimeoutMs = Number(config.commandTimeoutMs) > 0 ? Number(config.commandTimeoutMs) : 0
   const hostSearchDirs = []
   const containerPath = []
-  for (const entry of String(process.env.PATH ?? '').split(delimiter)) {
-    if (entry.trim().length === 0) continue
+  // Only directories the mount list makes visible inside the container count:
+  // any other host directory would be a dangling PATH entry there.
+  const addSearchDir = (entry) => {
     const real = realpathOrNormalized(entry)
-    if (!isDirectory(real)) continue
+    if (!isDirectory(real)) return
     if (!extraReadOnlyMounts.some((mount) => pathContains(mount, real)) && !pathContains(workspaceRoot, real)) {
-      continue
+      return
     }
     if (!hostSearchDirs.includes(real)) hostSearchDirs.push(real)
     if (!containerPath.includes(real)) containerPath.push(real)
   }
+  for (const entry of String(process.env.PATH ?? '').split(delimiter)) {
+    if (entry.trim().length === 0) continue
+    addSearchDir(entry)
+  }
+  // The ambient PATH wins on order; these only fill in what it did not carry.
+  for (const entry of wellKnownBinDirs()) addSearchDir(entry)
   for (const entry of DEFAULT_CONTAINER_PATH) {
     if (!containerPath.includes(entry)) containerPath.push(entry)
   }

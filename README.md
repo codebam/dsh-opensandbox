@@ -106,7 +106,7 @@ Relative `name` values resolve from dsh's profile `node_modules`, where `npm ins
 | `protocol` | `OPEN_SANDBOX_PROTOCOL` or `http` | `http` or `https`. |
 | `image` | `docker.io/library/debian:bookworm-slim` | Sandbox image URI. Pin a digest in production. |
 | `workspaceRoot` | `process.cwd()` | Host directory mounted read-write at the same path. |
-| `extraReadOnlyMounts` | `["/nix/store"]` | Extra host dirs mounted read-only at the same path. |
+| `extraReadOnlyMounts` | `["/nix/store"]` | Extra host dirs mounted read-only at the same path. An empty list means this default, because the loader materializes an absent optional array as `[]`. |
 | `timeoutSeconds` | `43200` | Sandbox TTL; the server minimum is 60. |
 | `requestTimeoutMs` | `300000` | Lifecycle HTTP timeout. |
 | `sandboxWaitMs` | `180000` | Max wait for a new sandbox to report `Running`. |
@@ -118,11 +118,17 @@ Relative `name` values resolve from dsh's profile `node_modules`, where `npm ins
 
 - One sandbox is created lazily per workspace root for the life of the dsh process.
 - Setup, cleanup, and usage are recorded in the sandbox metadata (`codebam.dsh.workspace`).
+- The container `PATH` is the host `PATH` restricted to directories a mount makes visible, plus
+  `/run/current-system/sw/bin`, `/etc/profiles/per-user/$USER/bin` and `~/.nix-profile/bin` when
+  they exist. That fallback matters because a dsh started by a systemd user unit inherits systemd's
+  minimal `PATH`, which carries no `/nix/store` entries at all.
 - `danger-full-access` still runs in the OpenSandbox world; the plugin never falls back to host
   execution.
 - Confined modes report `enforcement: "partial"`, because the container bounds host file effects
   but does not re-express workspace-only/read-only semantics inside the container. The host-side
   `ctx.fs` fence still enforces workspace writes for the model's file tools.
+- A read-only store means `nix build` cannot add paths from inside the sandbox; mount the host's
+  `nix/var/nix/daemon-socket` too (and accept what that grants) if containerized builds are wanted.
 
 ## Publishing
 

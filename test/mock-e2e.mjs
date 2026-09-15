@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
+import { existsSync, realpathSync, statSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { Context } from '@deepseek-ai/cordis'
 import { WebSocketServer } from 'ws'
+import opensandbox from '../index.mjs'
 import { OpenSandboxSubprocess } from '../src/subprocess.mjs'
 
 const captured = { commands: [], pty: [] }
@@ -63,6 +65,34 @@ budgeted.push('BASH_TOOL_OK\n')
 assert.equal(budgeted.readFrom(0).text, '_OK\n')
 assert.equal(budgeted.readFrom(0).lossy, true)
 
+// Regression: dsh resolves plugin config through the exported Config schema,
+// which materializes an absent optional array as []. That empty array must
+// still select the documented /nix/store default, otherwise the container comes
+// up with no toolchain mount -- commands still run, so only the missing tools
+// and the missing read-only volume reveal it. A plain-object config never
+// reaches this path, which is how the bug escaped the earlier mock.
+const nixStorePresent = existsSync('/nix/store')
+const systemBinPresent = existsSync('/run/current-system/sw/bin')
+const loaderResolved = new OpenSandboxSubprocess(
+  new Context(),
+  opensandbox.Config({
+    domain: '127.0.0.1:1',
+    apiKey: 'test-key',
+    image: 'example/test:latest',
+    workspaceRoot: '/tmp',
+  }),
+)
+assert.equal(loaderResolved.config.extraReadOnlyMounts.includes('/nix/store'), nixStorePresent)
+if (systemBinPresent) {
+  // A dsh started by a systemd user unit inherits systemd's minimal default
+  // PATH, which has no /nix/store entries, so the toolchain dirs cannot come
+  // from the ambient PATH alone.
+  const systemBin = realpathSync('/run/current-system/sw/bin')
+  const visible = systemBin === '/nix/store' || systemBin.startsWith('/nix/store/')
+  assert.equal(loaderResolved.config.containerPath.includes(systemBin), visible)
+  assert.equal(loaderResolved.config.hostSearchDirs.includes(systemBin), visible)
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${server.address().port}`)
   const path = url.pathname
@@ -72,6 +102,12 @@ const server = createServer(async (req, res) => {
       assert.equal(body.image.uri, 'example/test:latest')
       assert.equal(body.entrypoint[0], '/bin/sh')
       assert.equal(body.volumes[0].mountPath, '/tmp')
+      // The default toolchain mount has to survive config resolution.
+      if (nixStorePresent) {
+        const readOnly = body.volumes.filter((volume) => volume.readOnly === true)
+        assert.equal(readOnly.length, 1)
+        assert.equal(readOnly[0].mountPath, '/nix/store')
+      }
       res.writeHead(201, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ id: 'sbx-test' }))
       return
@@ -161,15 +197,14 @@ await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
 const port = server.address().port
 try {
   const ctx = new Context()
-  const provider = new OpenSandboxSubprocess(ctx, {
+  const provider = new OpenSandboxSubprocess(ctx, opensandbox.Config({
     domain: `127.0.0.1:${port}`,
     apiKey: 'test-key',
     image: 'example/test:latest',
     workspaceRoot: '/tmp',
-    extraReadOnlyMounts: [],
     requestTimeoutMs: 10_000,
     sandboxWaitMs: 5_000,
-  })
+  }))
 
   const handle = provider.spawn({
     argv: ['/bin/bash', '-c', 'echo hello'],
@@ -185,6 +220,9 @@ try {
   assert.equal(captured.commands[0].command, "'/bin/bash' '-c' 'echo hello'")
   assert.equal(captured.commands[0].argv, undefined)
   assert.equal(captured.commands[0].envs.PATH.includes('/usr/bin'), true)
+  if (systemBinPresent) {
+    assert.equal(captured.commands[0].envs.PATH.includes(realpathSync('/run/current-system/sw/bin')), true)
+  }
 
   const failed = provider.spawn({
     argv: ['/bin/bash', '-c', '__fail'],
