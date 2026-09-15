@@ -104,7 +104,7 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
   async runCollect(argv, { cwd = this.config.workspaceRoot, env = {}, signal, timeoutMs = 0 } = {}) {
     const sandboxId = await this.ensureSandboxFor(cwd)
     const body = {
-      argv: [...argv],
+      command: shellJoin(argv),
       cwd,
       envs: { ...this.config.containerEnv, ...env },
     }
@@ -167,7 +167,7 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
       env: this.config.containerEnv,
       metadata: {
         name: `dsh-opensandbox-${process.pid}`,
-        'codebam.dsh.workspace': root,
+        'codebam.dsh.workspace': sanitizeMetadataValue(root),
       },
       volumes,
     }
@@ -250,6 +250,18 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
   }
 }
 
+// OpenSandbox metadata values are label-like (<=63 chars, alphanumeric plus
+// '-', '_' and '.', starting and ending alphanumeric), so a host path cannot
+// be stored verbatim: every absolute path starts with '/'.
+export function sanitizeMetadataValue(value) {
+  const slug = String(value)
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .slice(0, 63)
+    .replace(/[^A-Za-z0-9]+$/, '')
+  return slug.length > 0 ? slug : 'workspace'
+}
+
 /** One managed command backed by an execd `/command` SSE stream. */
 class OpenSandboxCommandProcess {
   constructor(provider, spec) {
@@ -326,7 +338,9 @@ class OpenSandboxCommandProcess {
       const root = this.provider.mountRootFor(this.spec.cwd)
       this.sandboxId = await this.provider.ensureSandboxFor(root)
       const env = { ...this.provider.config.containerEnv, ...(this.spec.env ?? {}) }
+      const command = shellJoin(this.spec.argv)
       const body = {
+        command,
         cwd: this.spec.cwd,
         envs: env,
       }
@@ -334,9 +348,7 @@ class OpenSandboxCommandProcess {
       const stdin = this.spec.stdio?.stdin
       if (stdin !== undefined && stdin !== 'ignore' && typeof stdin === 'object') {
         const encoded = Buffer.from(String(stdin.data ?? ''), 'utf8').toString('base64')
-        body.command = `printf '%s' '${encoded}' | base64 -d | ${shellJoin(this.spec.argv)}`
-      } else {
-        body.argv = [...this.spec.argv]
+        body.command = `printf '%s' '${encoded}' | base64 -d | ${command}`
       }
       const response = await this.client.command(this.sandboxId, body, this.controller.signal)
       for await (const event of sseEvents(response, this.controller.signal)) {

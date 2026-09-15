@@ -36,6 +36,17 @@ release: the container is the boundary for **command execution**, not a replacem
 - The sandbox image must contain `/bin/sh` and a `sleep` that accepts `infinity`
   (`debian:*`, `ubuntu:*`, `python:*` and similar images do).
 
+### Known limitations
+
+- The `ctx.subprocess`/`ctx.sandbox` world works over plain HTTP execd calls.
+- `spawnTerminal` additionally needs a WebSocket to execd. The stock OpenSandbox
+  server running rootless podman currently cannot provide one: its server-side
+  WebSocket proxy fails to complete the handshake to the sandbox's published
+  execd port, and then crashes while reporting that failure on a `websockets`
+  API mismatch. Against that deployment only the HTTP executor (the model's
+  one-shot `bash` tool) is usable; persistent PTY sessions need a server whose
+  execd WebSocket is directly reachable.
+
 ## Install
 
 ```bash

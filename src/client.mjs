@@ -50,6 +50,11 @@ function parseSseChunk(raw) {
       data += (data.length > 0 ? '\n' : '') + (value.startsWith(' ') ? value.slice(1) : value)
     }
   }
+  if (data.trim().length === 0) {
+    // execd also emits legacy bare-JSON frames: one JSON object per
+    // blank-line-delimited block, with no `data:` prefix.
+    data = raw.split(/\r?\n/).find((line) => line.trim().length > 0) ?? ''
+  }
   if (data.trim().length === 0) return null
   try {
     return JSON.parse(data)
@@ -78,12 +83,20 @@ export async function* sseEvents(response, signal) {
         const raw = buffer.slice(0, boundary.index)
         buffer = buffer.slice(boundary.index + boundary[0].length)
         const event = parseSseChunk(raw)
-        if (event !== null) yield event
+        if (event !== null) {
+          yield event
+          // execd keeps the SSE connection open after the terminal event, so
+          // stop reading and let the finally block cancel the response body.
+          if (event.type === 'execution_complete' || event.type === 'error') return
+        }
       }
     }
     buffer += decoder.decode()
     const tail = parseSseChunk(buffer)
-    if (tail !== null) yield tail
+    if (tail !== null) {
+      yield tail
+      if (tail.type === 'execution_complete' || tail.type === 'error') return
+    }
   } finally {
     reader.cancel().catch(() => {})
   }
@@ -202,9 +215,11 @@ export class OpenSandboxClient {
   async execdBase(id, signal) {
     const cached = this.execdBases.get(id)
     if (cached !== undefined) return cached
+    // Direct published endpoint, the SDK default (use_server_proxy false).
+    // The server's own proxy is only needed when the client cannot reach it.
     const endpoint = await this.requestJson(
       'GET',
-      `/sandboxes/${encodeURIComponent(id)}/endpoints/44772?use_server_proxy=true`,
+      `/sandboxes/${encodeURIComponent(id)}/endpoints/44772`,
       { signal },
     )
     let host = textOr(endpoint?.endpoint, '')

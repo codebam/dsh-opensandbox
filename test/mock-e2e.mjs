@@ -13,16 +13,42 @@ function readJson(req) {
     req.setEncoding('utf8')
     req.on('data', (chunk) => { text += chunk })
     req.on('end', () => {
-      try { resolve(text.length > 0 ? JSON.parse(text) : {}) } catch (error) { reject(error) }
+      try {
+        const body = text.length > 0 ? JSON.parse(text) : {}
+        // Mirror the OpenSandbox label rules so an unsanitized host path in
+        // sandbox metadata fails here instead of on a live server.
+        if (body !== null && typeof body.metadata === 'object' && body.metadata !== null) {
+          for (const [key, value] of Object.entries(body.metadata)) {
+            assert.match(
+              String(value),
+              /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/,
+              `metadata ${key}`,
+            )
+          }
+        }
+        resolve(body)
+      } catch (error) {
+        reject(error)
+      }
     })
     req.on('error', reject)
   })
 }
+
 function sse(res, events) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
   for (const event of events) res.write(`data: ${JSON.stringify(event)}\n\n`)
   res.end()
 }
+
+// Regression: metadata values must satisfy the OpenSandbox label rules.
+const { sanitizeMetadataValue } = await import('../src/subprocess.mjs')
+assert.equal(sanitizeMetadataValue('/persistent/etc/nixos'), 'persistent-etc-nixos')
+assert.equal(sanitizeMetadataValue('/'), 'workspace')
+assert.match(
+  sanitizeMetadataValue(`/${'a'.repeat(200)}`),
+  /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/,
+)
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${server.address().port}`)
@@ -46,7 +72,7 @@ const server = createServer(async (req, res) => {
       res.writeHead(204); res.end(); return
     }
     if (req.method === 'GET' && path === '/v1/sandboxes/sbx-test/endpoints/44772') {
-      assert.equal(url.searchParams.get('use_server_proxy'), 'true')
+      assert.equal(url.searchParams.get('use_server_proxy'), null)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ endpoint: `127.0.0.1:${server.address().port}/v1/sandboxes/sbx-test/proxy/44772` }))
       return
@@ -54,7 +80,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && path === '/v1/sandboxes/sbx-test/proxy/44772/command') {
       const body = await readJson(req)
       captured.commands.push(body)
-      const failed = Array.isArray(body.argv) && body.argv.includes('__fail')
+      const failed = typeof body.command === 'string' && body.command.includes('__fail')
       if (failed) {
         sse(res, [
           { type: 'init', text: 'cmd-1', timestamp: 1 },
@@ -143,7 +169,8 @@ try {
   assert.equal(handle.collected.stdout.readFrom(0).text, 'hello\n')
   assert.equal(handle.collected.stderr.readFrom(0).text, 'warn\n')
   assert.equal(captured.commands[0].cwd, '/tmp')
-  assert.deepEqual(captured.commands[0].argv, ['/bin/bash', '-c', 'echo hello'])
+  assert.equal(captured.commands[0].command, "'/bin/bash' '-c' 'echo hello'")
+  assert.equal(captured.commands[0].argv, undefined)
   assert.equal(captured.commands[0].envs.PATH.includes('/usr/bin'), true)
 
   const failed = provider.spawn({
