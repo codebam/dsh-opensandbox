@@ -6,12 +6,15 @@
  *
  * - `ctx.subprocess` runs commands and PTY sessions through OpenSandbox execd;
  * - `ctx.sandbox` reports the container world's confinement facts to dsh's
- *   stock sandbox-aware consumers.
+ *   stock sandbox-aware consumers;
+ * - `ctx.fs` fences the host filesystem backend to the same mount table, so
+ *   the model-facing file tools cannot read or write outside the workspace
+ *   and configured mounts.
  *
  * The stock `dsh-bash-sandbox`, `dsh-terminal-bash`, and `dsh-tool-fs-search`
- * rows then run over the container world without changes. The host filesystem
- * provider stays useful because the configured workspace is bind-mounted at
- * the same absolute path inside the sandbox.
+ * rows then run over the container world without changes. The filesystem
+ * tools see the same files because the configured workspace is bind-mounted
+ * at the same absolute path inside the sandbox.
  *
  * @module @codebam/dsh-opensandbox
  */
