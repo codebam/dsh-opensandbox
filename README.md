@@ -62,6 +62,8 @@ policy boundary that keeps the model's file tools from escaping the mount table.
   is created rather than falling back to the host.
 - `extraWritableMounts` and `/directory-add <path> rw` are host-operator grants. The workspace is
   read-write by default; every other path is read-only unless a human explicitly says otherwise.
+- dsh's `danger-full-access` escalation cannot widen the mount table. It can lift dsh's session
+  policy, but a read-only mount stays read-only and a path outside the table stays denied.
 - Dynamic mounts are in-memory per dsh process and never persist. A restart returns to the
   reviewed profile configuration; put durable grants in the profile.
 
@@ -76,7 +78,8 @@ fetched from npm by this package.
 
 ## Configure dsh
 
-Add the plugin to a dsh profile and disable the two local providers it replaces. A profile
+Add the plugin to a dsh profile, disable the two local providers it replaces, and disable
+dsh's host-fs provider so the mount-fenced `ctx.fs` can replace it. A profile
 `cordis.patch.yml` (for example `$DSH_HOME/profiles/dsh-tui/cordis.patch.yml`) looks like this:
 
 ```yaml
@@ -84,6 +87,10 @@ Add the plugin to a dsh profile and disable the two local providers it replaces.
   disabled: true
 
 - id: sandbox
+  disabled: true
+
+# The shipped fs backend fences writes but leaves reads unconfined.
+- id: fs-sandbox
   disabled: true
 
 - insert:
