@@ -1,6 +1,6 @@
 {
   "name": "@codebam/dsh-opensandbox",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Run DeepSeek Harness command execution in OpenSandbox containers: an OpenSandbox-backed ctx.subprocess and container-world ctx.sandbox for dsh.",
   "keywords": [
     "deepseek-harness",

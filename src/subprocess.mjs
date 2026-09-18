@@ -64,6 +64,26 @@ function normalizeConfig(config = {}) {
     if (!isDirectory(path) || extraWritableMounts.includes(path)) continue
     extraWritableMounts.push(path)
   }
+  // Host directories under which dsh web/host sessions may open a project.
+  // They authorise a session workspace root; they are not themselves mounted,
+  // so a model `workdir` cannot turn a sibling project into a bind mount.
+  const workspaceParents = []
+  for (const entry of Array.isArray(config.workspaceParents) ? config.workspaceParents : []) {
+    const path = canonicalMountPath(entry)
+    // A parent that does not exist on this host contributes no authority; a
+    // session that wants to open under it will fail with the allowed-roots
+    // list instead of preventing dsh from starting at all.
+    if (!isDirectory(path)) continue
+    if (!workspaceParents.includes(path)) workspaceParents.push(path)
+  }
+  // Credential/control paths that must stay hidden from ctx.fs unless a
+  // trusted read path explicitly covers them. The OpenSandbox server guard
+  // rejects mounting a parent of any of these as well.
+  const protectedPaths = []
+  for (const entry of Array.isArray(config.protectedPaths) ? config.protectedPaths : []) {
+    const path = canonicalMountPath(entry)
+    if (!protectedPaths.includes(path)) protectedPaths.push(path)
+  }
   // Harness-owned host reads (user skills, ~/.dsh/AGENTS.md) that must stay
   // readable through ctx.fs without exposing them to the container and without
   // making them writable. Non-existent paths are allowed: the feature probes
@@ -117,6 +137,8 @@ function normalizeConfig(config = {}) {
     extraReadOnlyMounts,
     extraWritableMounts,
     trustedReadPaths,
+    workspaceParents,
+    protectedPaths,
     allowDynamicMounts: config.allowDynamicMounts !== false,
     timeoutSeconds,
     commandTimeoutMs,
@@ -159,6 +181,8 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
       readOnlyMounts: this.config.extraReadOnlyMounts,
       writableMounts: this.config.extraWritableMounts,
       trustedReadPaths: this.config.trustedReadPaths,
+      workspaceParents: this.config.workspaceParents,
+      protectedPaths: this.config.protectedPaths,
       allowDynamic: this.config.allowDynamicMounts,
     })
     this.sandboxes = new Map()
@@ -171,7 +195,7 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
 
   /** Execute one argv in the sandbox and collect its output. Internal helper. */
   async runCollect(argv, { cwd = this.config.workspaceRoot, env = {}, signal, timeoutMs = 0 } = {}) {
-    const sandboxId = await this.ensureSandboxFor(cwd)
+    const sandboxId = await this.ensureSandboxFor(cwd, this.config.workspaceRoot)
     const body = {
       command: shellJoin(argv),
       cwd,
@@ -195,23 +219,36 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
     return { exitCode, stdout, stderr }
   }
 
-  /** Resolve the configured mount root that covers one command cwd. */
-  mountRootFor(cwd) {
-    const root = this.mountPolicy.rootFor(cwd)
-    if (root !== undefined) return root.path
-    const roots = this.mountPolicy.describeMounts().map((mount) => mount.path).join(', ')
-    throw new OpenSandboxError(
-      `OpenSandbox: command cwd ${cwd} is outside every mount root (${roots}); ` +
-        'run /directory-add <host-path> [ro|rw] to scope another host directory into this session',
-    )
+  /** The session workspace root a spawn specification may use. */
+  sessionRootFor(spec = {}) {
+    const fromPolicy = spec?.sandboxPolicy?.workspaceRoot
+    if (typeof fromPolicy === 'string' && fromPolicy.trim().length > 0) return fromPolicy
+    const fromCwd = spec?.cwd
+    if (typeof fromCwd === 'string' && fromCwd.trim().length > 0) return fromCwd
+    return this.config.workspaceRoot
   }
 
-  /** Create, cache, and return one sandbox promise for a workspace root. */
-  startSandbox(root) {
-    const created = this.createSandbox(root)
-    this.sandboxes.set(root, created)
+  /** Resolve one command cwd to a bind-mount target and its session root. */
+  mountTargetFor(cwd, sessionRoot = this.config.workspaceRoot) {
+    return this.mountPolicy.resolveMount(cwd, sessionRoot)
+  }
+
+  /** Compatibility helper: the bind-mount root that covers one command cwd. */
+  mountRootFor(cwd, sessionRoot = this.config.workspaceRoot) {
+    return this.mountRootForTarget(this.mountTargetFor(cwd, sessionRoot))
+  }
+
+  /** The path form of a resolved mount target. */
+  mountRootForTarget(target) {
+    return target.root
+  }
+
+  /** Create, cache, and return one sandbox promise for a mount target. */
+  startSandbox(target) {
+    const created = this.createSandbox(target)
+    this.sandboxes.set(target.key, created)
     created.catch(() => {
-      if (this.sandboxes.get(root) === created) this.sandboxes.delete(root)
+      if (this.sandboxes.get(target.key) === created) this.sandboxes.delete(target.key)
     })
     return created
   }
@@ -233,11 +270,11 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
    * cached sandbox against the lifecycle server and create a replacement when
    * it is gone; concurrent callers share the replacement promise.
    */
-  async ensureSandboxFor(cwd) {
+  async ensureSandboxFor(cwd, sessionRoot = this.config.workspaceRoot) {
     if (this.closed) throw new OpenSandboxError('OpenSandbox: provider is closed')
-    const root = this.mountRootFor(cwd)
-    const cached = this.sandboxes.get(root)
-    if (cached === undefined) return this.startSandbox(root)
+    const target = this.mountTargetFor(cwd, sessionRoot)
+    const cached = this.sandboxes.get(target.key)
+    if (cached === undefined) return this.startSandbox(target)
 
     let sandboxId = ''
     try {
@@ -249,17 +286,17 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
       if (await this.sandboxIsAlive(sandboxId)) return sandboxId
       this.client.forgetEndpoint(sandboxId)
     }
-    if (this.sandboxes.get(root) === cached) {
-      this.sandboxes.delete(root)
-      return this.startSandbox(root)
+    if (this.sandboxes.get(target.key) === cached) {
+      this.sandboxes.delete(target.key)
+      return this.startSandbox(target)
     }
-    const replacement = this.sandboxes.get(root)
-    return replacement === undefined ? this.startSandbox(root) : replacement
+    const replacement = this.sandboxes.get(target.key)
+    return replacement === undefined ? this.startSandbox(target) : replacement
   }
 
-  /** Create one sandbox with the configured host mounts and their modes. */
-  async createSandbox(root) {
-    const volumes = this.mountPolicy.volumesFor(root)
+  /** Create one sandbox with the session workspace and configured mounts. */
+  async createSandbox(target) {
+    const volumes = this.mountPolicy.volumesFor(target.root, target.sessionRoot)
     const body = {
       image: { uri: this.config.image },
       entrypoint: ['/bin/sh', '-c', 'exec sleep infinity'],
@@ -268,7 +305,7 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
       env: this.config.containerEnv,
       metadata: {
         name: `dsh-opensandbox-${process.pid}`,
-        'codebam.dsh.workspace': sanitizeMetadataValue(root),
+        'codebam.dsh.workspace': sanitizeMetadataValue(target.sessionRoot),
       },
       volumes,
     }
@@ -502,8 +539,8 @@ class OpenSandboxCommandProcess {
   /** Resolve the sandbox, run the command, and consume its event stream. */
   async start() {
     try {
-      const root = this.provider.mountRootFor(this.spec.cwd)
-      this.sandboxId = await this.provider.ensureSandboxFor(root)
+      const sessionRoot = this.provider.sessionRootFor(this.spec)
+      this.sandboxId = await this.provider.ensureSandboxFor(this.spec.cwd, sessionRoot)
       const env = { ...this.provider.config.containerEnv, ...(this.spec.env ?? {}) }
       const command = shellJoin(this.spec.argv)
       const body = {
@@ -643,8 +680,8 @@ class OpenSandboxTerminalHandle {
   /** Create the PTY session and attach its WebSocket. */
   async start() {
     try {
-      const root = this.provider.mountRootFor(this.spec.cwd)
-      this.sandboxId = await this.provider.ensureSandboxFor(root)
+      const sessionRoot = this.provider.sessionRootFor(this.spec)
+      this.sandboxId = await this.provider.ensureSandboxFor(this.spec.cwd, sessionRoot)
       const env = {
         ...this.provider.config.containerEnv,
         ...(this.spec.terminalType === undefined ? {} : { TERM: this.spec.terminalType }),

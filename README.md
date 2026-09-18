@@ -19,13 +19,20 @@ over the container world without code changes:
 - `@deepseek-ai/dsh-tool-fs-search` — `grep`/`glob` run inside the sandbox
 - dsh's permission/escalation flow and `sandbox:policy` context
 
-The configured workspace is bind-mounted into the sandbox at the same absolute path, so the
-container and `ctx.fs` see the same files. The filesystem backend is host-side, but the plugin
-fences it with the same mount table the container uses: a model-facing `read`, `write`, or `edit`
-cannot resolve a path outside the workspace, the configured mounts, or the narrow
-`trustedReadPaths` list (used for harness-owned reads such as user skills and
-`~/.dsh/AGENTS.md`). Command execution is still the kernel boundary; the filesystem fence is the
-policy boundary that keeps the model's file tools from escaping the mount table.
+The session's immutable workspace is bind-mounted into the sandbox at the same absolute path, so
+the container and `ctx.fs` see the same files. This is the key difference from a single-project
+plugin: dsh web sessions can open any project directory under a configured `workspaceParents`
+root, and each session gets its own sandbox mounted with that exact workspace root. The
+configured `workspaceRoot` remains the fallback for calls without a session cwd.
+
+The filesystem backend is host-side, but the plugin fences it with the session workspace and the
+same mount table the container uses: a model-facing `read`, `write`, or `edit` cannot resolve a
+path outside the session workspace, the configured mounts, or the narrow `trustedReadPaths` list
+(used for harness-owned reads such as user skills and `~/.dsh/AGENTS.md`). Context-free harness
+discovery may read under `workspaceParents` (minus `protectedPaths`); it cannot turn one of those
+directories into a bind mount. Command execution is still the kernel boundary; the filesystem
+fence is the policy boundary that keeps the model's file tools from escaping the session
+workspace and mount table.
 
 ## Requirements
 
@@ -58,8 +65,11 @@ policy boundary that keeps the model's file tools from escaping the mount table.
   enforcement for confined modes because read-only/workspace-only semantics are not re-expressed
   per command. The `ctx.fs` fence applies the mount table to file-tool targets instead.
 - Mounted host paths must be allow-listed by the server
-  (`[storage] allowed_host_paths`); a command cwd outside the mount table fails before any sandbox
-  is created rather than falling back to the host.
+  (`[storage] allowed_host_paths`); a command cwd outside the session workspace and mount table
+  fails before any sandbox is created rather than falling back to the host.
+- `workspaceParents` deliberately grants context-free harness reads (and the ability to open a
+  dsh session) under those roots. Keep the list narrow, and put credential trees in
+  `protectedPaths`. A session workspace that contains a protected path is refused.
 - `extraWritableMounts` and `/directory-add <path> rw` are host-operator grants. The workspace is
   read-write by default; every other path is read-only unless a human explicitly says otherwise.
 - dsh's `danger-full-access` escalation cannot widen the mount table. It can lift dsh's session
@@ -118,6 +128,20 @@ dsh's host-fs provider so the mount-fenced `ctx.fs` can replace it. A profile
           - /home/your-user/.dsh/AGENTS.md
           - /home/your-user/.dsh/skills
 
+        # dsh web sessions may open any project under these roots; each
+        # session still binds only its own workspace root into its sandbox.
+        workspaceParents:
+          - /home/your-user/Documents/git
+
+        # Credential/control trees ctx.fs must not read and the server guard
+        # must not allow mounting a parent of.
+        protectedPaths:
+          - /home/your-user/.ssh
+          - /home/your-user/.gnupg
+          - /home/your-user/.dsh
+          - /home/your-user/.config/gh
+          - /home/your-user/.config/sops
+
         # Limits and lifetime.
         timeoutSeconds: 43200
         cpu: "4"
@@ -140,6 +164,8 @@ Relative `name` values resolve from dsh's profile `node_modules`, where `npm ins
 | `extraReadOnlyMounts` | `["/nix/store"]` | Extra host dirs mounted read-only at the same path. An empty list means this default, because the loader materializes an absent optional array as `[]`. |
 | `extraWritableMounts` | `[]` | Host dirs mounted read-write at the same path. Host-operator-only: never source this from model output or an untrusted file. |
 | `trustedReadPaths` | `[]` | Host paths `ctx.fs` may read for harness-owned features (skills, user instructions) without mounting them into the container and without allowing writes. |
+| `workspaceParents` | `[]` | Host directories under which a dsh session may open a project (for example a code root). They authorise a session workspace but are never bind-mounted themselves, so a sibling project cannot become a model `workdir` mount. |
+| `protectedPaths` | `[]` | Host credential/control trees that must stay hidden from `ctx.fs` unless a trusted read path explicitly covers them. The OpenSandbox server guard should name the same paths to reject bind mounts of their parents. |
 | `allowDynamicMounts` | `true` | Offer the human `/directory-add`, `/directory-remove`, and `/directory-list` commands. The added mounts live only in this dsh process. |
 | `provideFilesystem` | `true` | Mount the plugin's mount-fenced `ctx.fs`. Set `false` only if another trusted provider supplies `ctx.fs`; the shipped `dsh-fs-sandbox` leaves reads unconfined. |
 | `timeoutSeconds` | `43200` | Sandbox TTL; the server minimum is 60. The cached sandbox is revalidated before each command, so a server-reaped sandbox is replaced instead of leaving commands on a dead endpoint. |
@@ -153,7 +179,8 @@ Relative `name` values resolve from dsh's profile `node_modules`, where `npm ins
 
 ## What runs where
 
-- One sandbox is created lazily per workspace root and revalidated against the lifecycle server before a command uses it. If the server reaped it at its TTL, the plugin creates a replacement instead of reusing the dead endpoint.
+- One sandbox is created lazily per session workspace (or configured mount root) and revalidated against the lifecycle server before a command uses it. If the server reaped it at its TTL, the plugin creates a replacement instead of reusing the dead endpoint.
+- A session workspace must be under `workspaceRoot`/`workspaceParents`, must not contain a `protectedPaths` entry, and must not overlap a configured mount. The model may choose a `workdir` only inside that session workspace or a configured mount; sibling directories under a workspace parent are rejected as bind roots.
 - Setup, cleanup, and usage are recorded in the sandbox metadata (`codebam.dsh.workspace`).
 - The container `PATH` is the host `PATH` restricted to directories a mount makes visible, plus
   `/run/current-system/sw/bin`, `/etc/profiles/per-user/$USER/bin` and `~/.nix-profile/bin` when

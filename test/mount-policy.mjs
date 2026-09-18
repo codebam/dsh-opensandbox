@@ -35,8 +35,8 @@ try {
   assert.equal(policy.rootFor(join(workspace, '..', 'read-only'))?.path, readOnly)
   assert.equal(policy.isWritable(join(workspace, 'x')), true)
   assert.equal(policy.isWritable(join(readOnly, 'x')), false)
-  assert.equal(policy.isVisible(trusted), true)
-  assert.equal(policy.isVisible('/etc/passwd'), false)
+  assert.equal(policy.isReadable(trusted), true)
+  assert.equal(policy.isReadable('/etc/passwd'), false)
 
   assert.throws(
     () => new MountPolicy({ workspaceRoot: workspace, readOnlyMounts: [readOnly], writableMounts: [readOnly] }),
@@ -50,6 +50,42 @@ try {
     () => new MountPolicy({ workspaceRoot: workspace, readOnlyMounts: ['/'] }),
     /mount roots overlap/,
   )
+
+  const session = join(base, 'session')
+  const sibling = join(base, 'sibling')
+  mkdirSync(session)
+  mkdirSync(sibling)
+  writeFileSync(join(session, 'session.txt'), 'session\n')
+  writeFileSync(join(sibling, 'sibling.txt'), 'sibling\n')
+  const sessionPolicy = new MountPolicy({
+    workspaceRoot: workspace,
+    readOnlyMounts: [readOnly],
+    writableMounts: [writable],
+    workspaceParents: [base],
+    trustedReadPaths: [trusted],
+  })
+  assert.equal(sessionPolicy.isAllowedSessionRoot(session), true)
+  assert.equal(sessionPolicy.isAllowedSessionRoot(sibling), true)
+  assert.equal(sessionPolicy.resolveMount(join(session, 'nested', 'missing'), session).root, session)
+  assert.throws(() => sessionPolicy.resolveMount(sibling, session), /outside the session workspace/)
+  assert.equal(sessionPolicy.isReadable(join(sibling, 'sibling.txt'), { allowParents: true }), true)
+  assert.equal(sessionPolicy.isReadable(join(sibling, 'sibling.txt')), false)
+  assert.equal(sessionPolicy.isWritable(join(session, 'session.txt'), { sessionRoot: session }), true)
+  assert.equal(sessionPolicy.isWritable(join(sibling, 'sibling.txt'), { sessionRoot: session }), false)
+  const sessionVolumes = sessionPolicy.volumesFor(session, session)
+  const sessionByPath = new Map(sessionVolumes.map((volume) => [volume.mountPath, volume]))
+  assert.equal(sessionByPath.get(session).readOnly, undefined)
+  assert.equal(sessionByPath.has(sibling), false)
+
+  const protectedDir = join(base, 'protected')
+  mkdirSync(protectedDir)
+  const guardedPolicy = new MountPolicy({
+    workspaceRoot: workspace,
+    workspaceParents: [base],
+    protectedPaths: [protectedDir],
+  })
+  assert.equal(guardedPolicy.isReadable(join(protectedDir, 'secret'), { allowParents: true }), false)
+  assert.throws(() => guardedPolicy.assertMountableSessionRoot(base), /contains protected host path/)
 
   const added = policy.addDynamic(join(base, 'dynamic'), 'ro')
   assert.deepEqual(added, { path: dynamic, mode: 'ro', changed: true })
@@ -83,7 +119,7 @@ try {
   assert.equal(await fs.readText(await fs.resolve('workspace.txt')), 'workspace\n')
   assert.equal(await fs.readText(await fs.resolve(join(readOnly, 'read-only.txt'))), 'read only\n')
   assert.equal(await fs.readText(await fs.resolve(trusted)), 'trusted instructions\n')
-  await assert.rejects(fs.resolve('/etc/passwd'), (error) => error.code === 'FS_SANDBOX_DENIED')
+  await assert.rejects(fs.resolve('/etc/passwd'), (error) => error.code === 'FS_NOT_FOUND')
   await assert.rejects(fs.resolve(join(readOnly, 'x.txt')).then((target) => fs.writeText(target, 'x')), (error) => error.code === 'FS_SANDBOX_DENIED')
   const writableTarget = await fs.resolve(join(writable, 'written.txt'))
   await fs.writeText(writableTarget, 'written\n', { kind: 'createIfAbsent' })
@@ -94,10 +130,34 @@ try {
   symlinkSync('/etc/passwd', join(workspace, 'outside-link'))
   const workspaceList = await fs.listDir(await fs.resolve('.'))
   assert.equal(workspaceList.some((entry) => entry.name === 'outside-link'), false)
-  await assert.rejects(fs.resolve('outside-link'), (error) => error.code === 'FS_SANDBOX_DENIED')
+  await assert.rejects(fs.resolve('outside-link'), (error) => error.code === 'FS_NOT_FOUND')
+  await assert.rejects(
+    fs.resolve('outside-link', { cwd: workspace }),
+    (error) => error.code === 'FS_SANDBOX_DENIED',
+  )
   assert.equal(fs.processPathFromHostPath('/etc/passwd'), undefined)
   assert.equal(fs.processPathFromHostPath(join(workspace, 'workspace.txt')), join(workspace, 'workspace.txt'))
   assert.equal(fs.sandboxMode, 'workspace-write')
+
+  const fsSession = new OpenSandboxFileSystem(new Context(), { mountPolicy: sessionPolicy, cwd: workspace })
+  const sessionTarget = await fsSession.resolve('session.txt', { cwd: session })
+  assert.equal(await fsSession.readText(sessionTarget), 'session\n')
+  assert.equal((await fsSession.resolve(join(session, '.git'))).displayPath, join(session, '.git'))
+  await assert.rejects(fsSession.resolve('/etc/passwd', { cwd: session }), (error) => error.code === 'FS_SANDBOX_DENIED')
+  await assert.rejects(
+    fsSession.resolve(join(sibling, 'sibling.txt'), { cwd: session }),
+    (error) => error.code === 'FS_SANDBOX_DENIED',
+  )
+  const sessionWrite = await fsSession.resolve(join(session, 'written.txt'), { cwd: session })
+  const sessionWritePolicy = { mode: 'workspace-write', workspaceRoot: session }
+  await fsSession.writeText(sessionWrite, 'written\n', { kind: 'createIfAbsent' }, undefined, sessionWritePolicy)
+  assert.equal(await fsSession.readText(sessionWrite), 'written\n')
+  await assert.rejects(
+    fsSession
+      .resolve(join(sibling, 'sibling.txt'), { cwd: session })
+      .then((target) => fsSession.writeText(target, 'nope\n', undefined, undefined, sessionWritePolicy)),
+    (error) => error.code === 'FS_SANDBOX_DENIED',
+  )
 
   // ── OpenSandboxSubprocess: arbitrary absolute cwd is rejected ────────────
   const provider = new OpenSandboxSubprocess(new Context(), {
@@ -111,10 +171,26 @@ try {
   assert.equal(provider.mountRootFor(join(workspace, 'nested', 'missing')), workspace)
   assert.equal(provider.mountRootFor(readOnly), readOnly)
   assert.equal(provider.mountRootFor(writable), writable)
-  assert.throws(() => provider.mountRootFor('/etc'), /outside every mount root/)
+  assert.throws(() => provider.mountRootFor('/etc'), /outside the session workspace|every configured mount root/)
   const escape = join(workspace, 'escape-link')
   symlinkSync('/etc', escape)
-  assert.throws(() => provider.mountRootFor(escape), /outside every mount root/)
+  assert.throws(() => provider.mountRootFor(escape), /outside the session workspace|every configured mount root/)
+
+  const sessionProvider = new OpenSandboxSubprocess(new Context(), {
+    domain: '127.0.0.1:1',
+    apiKey: 'test-key',
+    workspaceRoot: workspace,
+    extraReadOnlyMounts: [readOnly],
+    extraWritableMounts: [writable],
+    workspaceParents: [base],
+    allowDynamicMounts: true,
+  })
+  assert.equal(sessionProvider.mountRootFor(join(session, 'nested', 'missing'), session), session)
+  assert.throws(
+    () => sessionProvider.mountRootFor(join(sibling, 'missing'), session),
+    /outside the session workspace/,
+  )
+  await sessionProvider.close()
 
   // ── /directory-add, /directory-remove, /directory-list ───────────────────
   const definitions = new Map()

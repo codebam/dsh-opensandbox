@@ -69,6 +69,19 @@ export const Config = z.object({
    */
   trustedReadPaths: z.array(z.string()).required(false),
   /**
+   * Host directories under which dsh web/host sessions may legitimately open
+   * a project (for example a code root containing several repositories).
+   * They authorise a session workspace, but are not themselves bind-mounted,
+   * so a model `workdir` still cannot turn a sibling directory into a mount.
+   */
+  workspaceParents: z.array(z.string()).required(false),
+  /**
+   * Host credential/control trees that must stay hidden from ctx.fs unless a
+   * trusted read path explicitly covers them or a configured read-only mount
+   * exposes them. The OpenSandbox server guard should name the same paths.
+   */
+  protectedPaths: z.array(z.string()).required(false),
+  /**
    * Offer the `/directory-add`, `/directory-remove`, and `/directory-list`
    * human slash commands. The human UI owns consent; an agent cannot invoke
    * the commands. Added mounts are in-memory for this dsh process. Default:
