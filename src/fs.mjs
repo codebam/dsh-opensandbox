@@ -67,6 +67,13 @@ export class OpenSandboxFileSystem extends LocalFileSystem {
     return super.lstat(path, opts, signal)
   }
 
+  /** Drop directory entries whose resolved target escapes the mount table. */
+  async listDir(target, signal) {
+    this.assertVisible(target, 'access')
+    const entries = await super.listDir(target, signal)
+    return entries.filter((entry) => this.mountPolicy.isVisible(String(entry.target.targetKey)))
+  }
+
   /** Map a host path only when this backend is allowed to read it. */
   processPathFromHostPath(hostPath) {
     if (typeof hostPath !== 'string' || !isAbsolute(hostPath)) return undefined
