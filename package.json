@@ -1,6 +1,6 @@
 {
   "name": "@codebam/dsh-opensandbox",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run DeepSeek Harness command execution in OpenSandbox containers: an OpenSandbox-backed ctx.subprocess and container-world ctx.sandbox for dsh.",
   "keywords": [
     "deepseek-harness",
@@ -41,7 +41,7 @@
   },
   "scripts": {
     "check": "for f in index.mjs src/*.mjs; do node --check \"$f\" || exit 1; done",
-    "test": "node test/mock-e2e.mjs",
+    "test": "node test/mount-policy.mjs && node test/mock-e2e.mjs",
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
@@ -51,7 +51,9 @@
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/schemastery": "*",
     "@deepseek-ai/dsh-sandbox": "*",
-    "@deepseek-ai/dsh-subprocess": "*"
+    "@deepseek-ai/dsh-subprocess": "*",
+    "@deepseek-ai/dsh-fs": "*",
+    "@deepseek-ai/dsh-fs-local": "*"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
@@ -64,6 +66,12 @@
       "optional": true
     },
     "@deepseek-ai/dsh-subprocess": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-fs": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-fs-local": {
       "optional": true
     }
   }

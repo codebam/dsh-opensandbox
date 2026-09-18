@@ -16,9 +16,14 @@
  * @module @codebam/dsh-opensandbox
  */
 import z from '@deepseek-ai/schemastery'
+import { registerDirectoryCommands } from './src/commands.mjs'
+import { OpenSandboxFileSystem } from './src/fs.mjs'
+import { MountPolicy } from './src/mounts.mjs'
 import { OpenSandboxSandboxProvider } from './src/sandbox.mjs'
 import { OpenSandboxSubprocess } from './src/subprocess.mjs'
 
+export { OpenSandboxFileSystem } from './src/fs.mjs'
+export { MountPolicy } from './src/mounts.mjs'
 export { OpenSandboxSandboxProvider } from './src/sandbox.mjs'
 export { OpenSandboxSubprocess } from './src/subprocess.mjs'
 export { OpenSandboxClient, OpenSandboxError } from './src/client.mjs'
@@ -46,6 +51,33 @@ export const Config = z.object({
   workspaceRoot: z.string().required(false),
   /** Additional host directories mounted read-only at the same absolute path. */
   extraReadOnlyMounts: z.array(z.string()).required(false),
+  /**
+   * Additional host directories mounted read-write at the same absolute path.
+   * This is a host-operator-only grant: keep it out of any model-influenced
+   * configuration. Only configured mount roots are bindable; a command cwd
+   * outside this table is rejected instead of becoming an arbitrary mount.
+   */
+  extraWritableMounts: z.array(z.string()).required(false),
+  /**
+   * Host paths ctx.fs may read for harness-owned features (user skills,
+   * `~/.dsh/AGENTS.md`) without exposing them to the container and without
+   * making them writable. Keep this list narrow; every entry widens what a
+   * model-facing `read` can reach.
+   */
+  trustedReadPaths: z.array(z.string()).required(false),
+  /**
+   * Offer the `/directory-add`, `/directory-remove`, and `/directory-list`
+   * human slash commands. The human UI owns consent; an agent cannot invoke
+   * the commands. Added mounts are in-memory for this dsh process. Default:
+   * true.
+   */
+  allowDynamicMounts: z.boolean().required(false),
+  /**
+   * Mount the plugin's mount-fenced ctx.fs backend. Default: true. Disable it
+   * only when another provider you trust already supplies `ctx.fs`; with the
+   * shipped `dsh-fs-sandbox` still mounted, reads stay unconfined.
+   */
+  provideFilesystem: z.boolean().required(false),
   /** Sandbox TTL in seconds (minimum 60). Default: 43200 (12h). */
   timeoutSeconds: z.number().required(false),
   /** Lifecycle HTTP request timeout in milliseconds. Default: 300000. */
@@ -80,6 +112,25 @@ export function apply(ctx, config = {}) {
   const options = config ?? {}
   const subprocess = new OpenSandboxSubprocess(ctx, options)
   const sandbox = new OpenSandboxSandboxProvider(ctx, options)
+  if (options.provideFilesystem !== false) {
+    if (ctx.get('fs') !== undefined) {
+      throw new Error(
+        'dsh-opensandbox: ctx.fs is already provided; disable the fs-sandbox row (or set provideFilesystem: false) before mounting this plugin',
+      )
+    }
+    new OpenSandboxFileSystem(ctx, {
+      cwd: subprocess.config.workspaceRoot,
+      mountPolicy: subprocess.mountPolicy,
+    })
+  }
+  if (subprocess.config.allowDynamicMounts) {
+    ctx.inject(['commands'], (commandCtx) => {
+      commandCtx.effect(
+        () => registerDirectoryCommands(commandCtx, subprocess),
+        'dsh-opensandbox: directory commands',
+      )
+    })
+  }
   ctx.effect(
     () => () => Promise.allSettled([subprocess.close(), sandbox.close()]),
     'dsh-opensandbox: container world cleanup',

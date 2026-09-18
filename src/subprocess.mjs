@@ -1,13 +1,13 @@
-import { constants as fsConstants, accessSync, existsSync } from 'node:fs'
+import { constants as fsConstants, accessSync } from 'node:fs'
 import { homedir, userInfo } from 'node:os'
-import { delimiter, isAbsolute, join, resolve } from 'node:path'
+import { delimiter, isAbsolute, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import WebSocket from 'ws'
 import { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { OpenSandboxClient, OpenSandboxError, resolveApiKey, resolveBaseUrl, sseEvents } from './client.mjs'
 import { TailCollector } from './collect.mjs'
+import { canonicalMountPath, MountPolicy } from './mounts.mjs'
 import {
-  absoluteHostPath,
   errorMessage,
   isDirectory,
   pathContains,
@@ -54,9 +54,24 @@ function normalizeConfig(config = {}) {
       : ['/nix/store']
   const extraReadOnlyMounts = []
   for (const entry of requestedReadOnly) {
-    const path = realpathOrNormalized(String(entry))
+    const path = canonicalMountPath(entry)
     if (!isDirectory(path) || extraReadOnlyMounts.includes(path)) continue
     extraReadOnlyMounts.push(path)
+  }
+  const extraWritableMounts = []
+  for (const entry of Array.isArray(config.extraWritableMounts) ? config.extraWritableMounts : []) {
+    const path = canonicalMountPath(entry)
+    if (!isDirectory(path) || extraWritableMounts.includes(path)) continue
+    extraWritableMounts.push(path)
+  }
+  // Harness-owned host reads (user skills, ~/.dsh/AGENTS.md) that must stay
+  // readable through ctx.fs without exposing them to the container and without
+  // making them writable. Non-existent paths are allowed: the feature probes
+  // them before they exist.
+  const trustedReadPaths = []
+  for (const entry of Array.isArray(config.trustedReadPaths) ? config.trustedReadPaths : []) {
+    const path = canonicalMountPath(entry)
+    if (!trustedReadPaths.includes(path)) trustedReadPaths.push(path)
   }
   const requestTimeoutMs = Number(config.requestTimeoutMs) > 0 ? Number(config.requestTimeoutMs) : 300_000
   const sandboxWaitMs = Number(config.sandboxWaitMs) > 0 ? Number(config.sandboxWaitMs) : 180_000
@@ -64,14 +79,13 @@ function normalizeConfig(config = {}) {
   const commandTimeoutMs = Number(config.commandTimeoutMs) > 0 ? Number(config.commandTimeoutMs) : 0
   const hostSearchDirs = []
   const containerPath = []
-  // Only directories the mount list makes visible inside the container count:
+  const visibleRoots = [workspaceRoot, ...extraReadOnlyMounts, ...extraWritableMounts]
+  // Only directories an actual mount makes visible inside the container count:
   // any other host directory would be a dangling PATH entry there.
   const addSearchDir = (entry) => {
     const real = realpathOrNormalized(entry)
     if (!isDirectory(real)) return
-    if (!extraReadOnlyMounts.some((mount) => pathContains(mount, real)) && !pathContains(workspaceRoot, real)) {
-      return
-    }
+    if (!visibleRoots.some((root) => pathContains(root, real))) return
     if (!hostSearchDirs.includes(real)) hostSearchDirs.push(real)
     if (!containerPath.includes(real)) containerPath.push(real)
   }
@@ -101,6 +115,9 @@ function normalizeConfig(config = {}) {
     workspaceRoot,
     image: textOr(config.image, DEFAULT_IMAGE),
     extraReadOnlyMounts,
+    extraWritableMounts,
+    trustedReadPaths,
+    allowDynamicMounts: config.allowDynamicMounts !== false,
     timeoutSeconds,
     commandTimeoutMs,
     requestTimeoutMs,
@@ -137,7 +154,15 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
       requestTimeoutMs: this.config.requestTimeoutMs,
       sandboxWaitMs: this.config.sandboxWaitMs,
     })
+    this.mountPolicy = new MountPolicy({
+      workspaceRoot: this.config.workspaceRoot,
+      readOnlyMounts: this.config.extraReadOnlyMounts,
+      writableMounts: this.config.extraWritableMounts,
+      trustedReadPaths: this.config.trustedReadPaths,
+      allowDynamic: this.config.allowDynamicMounts,
+    })
     this.sandboxes = new Map()
+    this.recycling = Promise.resolve()
     this.executableCache = new Map()
     this.liveProcesses = new Set()
     this.liveTerminals = new Set()
@@ -170,12 +195,15 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
     return { exitCode, stdout, stderr }
   }
 
-  /** Resolve the mounted root that covers one command cwd. */
+  /** Resolve the configured mount root that covers one command cwd. */
   mountRootFor(cwd) {
-    const path = realpathOrNormalized(cwd)
-    if (pathContains(this.config.workspaceRoot, path)) return this.config.workspaceRoot
-    if (isDirectory(path)) return path
-    throw new OpenSandboxError(`OpenSandbox: command cwd ${cwd} is not a host directory under a mounted root`)
+    const root = this.mountPolicy.rootFor(cwd)
+    if (root !== undefined) return root.path
+    const roots = this.mountPolicy.describeMounts().map((mount) => mount.path).join(', ')
+    throw new OpenSandboxError(
+      `OpenSandbox: command cwd ${cwd} is outside every mount root (${roots}); ` +
+        'run /directory-add <host-path> [ro|rw] to scope another host directory into this session',
+    )
   }
 
   /** Create, cache, and return one sandbox promise for a workspace root. */
@@ -229,17 +257,9 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
     return replacement === undefined ? this.startSandbox(root) : replacement
   }
 
-  /** Create one sandbox with the host workspace and toolchain mounts. */
+  /** Create one sandbox with the configured host mounts and their modes. */
   async createSandbox(root) {
-    const volumes = [
-      { name: 'workspace', host: { path: root }, mountPath: root },
-      ...this.config.extraReadOnlyMounts.map((path, index) => ({
-        name: `ro${index}`,
-        host: { path },
-        mountPath: path,
-        readOnly: true,
-      })),
-    ]
+    const volumes = this.mountPolicy.volumesFor(root)
     const body = {
       image: { uri: this.config.image },
       entrypoint: ['/bin/sh', '-c', 'exec sleep infinity'],
@@ -253,6 +273,58 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
       volumes,
     }
     return this.client.createSandbox(body)
+  }
+
+  /**
+   * Add one human-scoped host directory to the mount table and recycle the
+   * live sandboxes so the next command starts from the new boundary.
+   *
+   * This is called only by the `/directory-add` slash command: the human UI
+   * owns the consent. The mount is in-memory for this dsh process; profile
+   * mounts stay in configuration, which means a restart always returns to the
+   * reviewed boundary.
+   */
+  async addDynamicMount(rawPath, access) {
+    const result = this.mountPolicy.addDynamic(rawPath, access)
+    if (result.changed) await this.invalidateSandboxes()
+    return result
+  }
+
+  /** Remove one dynamic mount and recycle the live sandboxes. */
+  async removeDynamicMount(rawPath) {
+    const result = this.mountPolicy.removeDynamic(rawPath)
+    await this.invalidateSandboxes()
+    return result
+  }
+
+  /** Kill every cached sandbox without closing the provider. */
+  invalidateSandboxes() {
+    this.recycling = this.recycling.then(() => this.recycleSandboxes()).catch(() => {})
+    return this.recycling
+  }
+
+  /** Drop and best-effort kill the current sandbox cache. */
+  async recycleSandboxes() {
+    const pending = [...this.sandboxes.values()]
+    this.sandboxes.clear()
+    await Promise.allSettled(
+      pending.map(async (created) => {
+        let sandboxId = ''
+        try {
+          sandboxId = await created
+        } catch {
+          return
+        }
+        if (sandboxId.length === 0) return
+        this.client.forgetEndpoint(sandboxId)
+        await this.client.killSandbox(sandboxId).catch(() => {})
+      }),
+    )
+  }
+
+  /** The current mount table for `/directory-list`. */
+  listMounts() {
+    return this.mountPolicy.describe()
   }
 
   /** Resolve one executable in the remote world. */
@@ -320,6 +392,7 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
   async close() {
     if (this.closed) return
     this.closed = true
+    await this.recycling.catch(() => {})
     for (const processHandle of [...this.liveProcesses]) processHandle.terminate()
     for (const terminal of [...this.liveTerminals]) await terminal.terminate().catch(() => {})
     const sandboxes = await Promise.allSettled([...this.sandboxes.values()])
