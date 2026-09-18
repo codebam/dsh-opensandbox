@@ -3,7 +3,7 @@ import { homedir, userInfo } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import WebSocket from 'ws'
-import { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import { SubprocessRuntime, SubprocessExecutableNotFoundError } from '@deepseek-ai/dsh-subprocess'
 import { OpenSandboxClient, OpenSandboxError, resolveApiKey, resolveBaseUrl, sseEvents } from './client.mjs'
 import { TailCollector } from './collect.mjs'
 import { canonicalMountPath, MountPolicy } from './mounts.mjs'
@@ -327,6 +327,16 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
     return this.mountPolicy.describe()
   }
 
+  /**
+   * Shell-selection facts for the container world. The Debian image is POSIX
+   * and carries /bin/bash; the seam expects resolveExecutable to verify the
+   * path before allocation.
+   */
+  async terminalEnvironment(signal) {
+    signal?.throwIfAborted()
+    return { platform: 'posix', defaultShell: '/bin/bash' }
+  }
+
   /** Resolve one executable in the remote world. */
   async resolveExecutable(command, env, signal) {
     const name = textOr(command, '')
@@ -355,7 +365,7 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
     })
     const resolved = result.stdout.trim().split('\n')[0] ?? ''
     if (result.exitCode !== 0 || resolved.length === 0) {
-      throw new OpenSandboxError(`OpenSandbox: executable ${JSON.stringify(name)} was not found in the sandbox`)
+      throw new SubprocessExecutableNotFoundError(`OpenSandbox: executable ${JSON.stringify(name)} was not found in the sandbox`)
     }
     this.executableCache.set(name, resolved)
     return resolved
@@ -371,6 +381,9 @@ export class OpenSandboxSubprocess extends SubprocessRuntime {
     if (typeof spec.cwd !== 'string' || spec.cwd.length === 0) throw new OpenSandboxError('OpenSandbox: spawn requires a cwd')
     if (spec.stdio?.stdin === 'pipe') {
       throw new OpenSandboxError('OpenSandbox: interactive stdin pipes are not supported; pass { data } or ignore stdin')
+    }
+    if (spec.stdio?.control === 'pipe') {
+      throw new OpenSandboxError('OpenSandbox: the control duplex pipe is not supported over execd')
     }
     const processHandle = new OpenSandboxCommandProcess(this, spec)
     this.liveProcesses.add(processHandle)
@@ -632,7 +645,11 @@ class OpenSandboxTerminalHandle {
     try {
       const root = this.provider.mountRootFor(this.spec.cwd)
       this.sandboxId = await this.provider.ensureSandboxFor(root)
-      const env = { ...this.provider.config.containerEnv, ...(this.spec.env ?? {}) }
+      const env = {
+        ...this.provider.config.containerEnv,
+        ...(this.spec.terminalType === undefined ? {} : { TERM: this.spec.terminalType }),
+        ...(this.spec.env ?? {}),
+      }
       const argv = Array.isArray(this.spec.argv) && this.spec.argv.length > 0 ? this.spec.argv : ['/bin/bash', '--noprofile', '--norc', '-i']
       const assignments = Object.entries(env).map(([key, value]) => `${key}=${String(value)}`)
       const command = `exec ${shellJoin(['env', ...assignments, ...argv])}`
@@ -698,6 +715,15 @@ class OpenSandboxTerminalHandle {
   async write(data) {
     if (this.terminated) throw new OpenSandboxError('OpenSandbox: PTY is terminating')
     this.sendBinary(Buffer.concat([Buffer.from([0x00]), Buffer.from(String(data), 'utf8')]))
+  }
+
+  /** Change the remote PTY dimensions. */
+  async resize(cols, rows) {
+    if (this.terminated) throw new OpenSandboxError('OpenSandbox: PTY is terminating')
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) {
+      throw new OpenSandboxError('OpenSandbox: terminal dimensions must be positive integers')
+    }
+    this.sendJson({ type: 'resize', cols, rows })
   }
 
   /** Remote PTY foreground inspection is not exposed; consumers fall back. */

@@ -23,7 +23,8 @@ export class OpenSandboxSandboxProvider extends SandboxProvider {
   }
 
   /** Return the world's argv unchanged; the container is the boundary. */
-  confine(argv, policy) {
+  async confine(argv, policy, signal) {
+    signal?.throwIfAborted()
     const mode = policy?.mode ?? 'workspace-write'
     return {
       argv: [...argv],
